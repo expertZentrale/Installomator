@@ -452,6 +452,11 @@ printlog(){
     # Never log the GitHub API token
     [[ -n $githubAPIToken ]] && log_message=${log_message//${(b)githubAPIToken}/<redacted>}
     [[ -n $GITHUB_API_TOKEN ]] && log_message=${log_message//${(b)GITHUB_API_TOKEN}/<redacted>}
+    # also any GITHUB_API_TOKEN=... argument, even if the variable was overwritten later
+    () {
+        setopt localoptions extendedglob
+        log_message=${log_message//GITHUB_API_TOKEN=[^[:space:]]#/GITHUB_API_TOKEN=<redacted>}
+    }
 
     # Check to make sure that the log isn't the same as the last, if it is then don't log and increment a timer.
     if [[ ${log_message} == ${previous_log_message} ]]; then
@@ -559,10 +564,17 @@ resolveGitHubAPIToken() {
 # Falls back to an unauthenticated request if the authenticated one fails.
 curl() {
     local arg useToken=0 hasAuthHeader=0
+    local otherURL=0
     for arg in "$@"; do
-        [[ $arg == https://api.github.com/* ]] && useToken=1
+        if [[ $arg == https://api.github.com/* ]]; then
+            useToken=1
+        elif [[ $arg =~ '^[a-zA-Z][a-zA-Z0-9+.-]*://' ]]; then
+            # any other URL in the same call would receive the header as well
+            otherURL=1
+        fi
         [[ ${arg:l} == authorization:* ]] && hasAuthHeader=1
     done
+    (( otherURL )) && useToken=0
     if (( useToken && ! hasAuthHeader )) && resolveGitHubAPIToken; then
         command curl -H "Authorization: Bearer $githubAPIToken" "$@"
         local curlStatus=$?
