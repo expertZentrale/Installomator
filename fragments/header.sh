@@ -338,6 +338,15 @@ datadogAPI=""
 # Simply add your own API key for this in order to have logs sent to Datadog
 # See more here: https://www.datadoghq.com/product/log-management/
 
+# GitHub API token (optional) used for requests to api.github.com
+# Raises the GitHub API rate limit from 60 to 5000 requests per hour.
+GITHUB_API_TOKEN=""
+# Can be set as argument: GITHUB_API_TOKEN=github_pat_...
+# If empty, the token from App-Auto-Patch managed preferences (xyz.techitout.appAutoPatch:
+# GitHubAPIAuthEnabled=TRUE and GitHubAPIToken) is used when present.
+# Without any token, requests are sent unauthenticated.
+# The token is only sent to api.github.com and is redacted in the log.
+
 # Log Date format used when parsing logs for debugging, this is the default used by
 # install.log, override this in the case statements if you need something custom per
 # application (See adobeillustrator).  Using stadard GNU Date formatting.

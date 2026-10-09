@@ -338,6 +338,15 @@ datadogAPI=""
 # Simply add your own API key for this in order to have logs sent to Datadog
 # See more here: https://www.datadoghq.com/product/log-management/
 
+# GitHub API token (optional) used for requests to api.github.com
+# Raises the GitHub API rate limit from 60 to 5000 requests per hour.
+GITHUB_API_TOKEN=""
+# Can be set as argument: GITHUB_API_TOKEN=github_pat_...
+# If empty, the token from App-Auto-Patch managed preferences (xyz.techitout.appAutoPatch:
+# GitHubAPIAuthEnabled=TRUE and GitHubAPIToken) is used when present.
+# Without any token, requests are sent unauthenticated.
+# The token is only sent to api.github.com and is redacted in the log.
+
 # Log Date format used when parsing logs for debugging, this is the default used by
 # install.log, override this in the case statements if you need something custom per
 # application (See adobeillustrator).  Using stadard GNU Date formatting.
@@ -353,7 +362,7 @@ if [[ $(/usr/bin/arch) == "arm64" ]]; then
     fi
 fi
 VERSION="10.10beta"
-VERSIONDATE="2026-10-06"
+VERSIONDATE="2026-10-09"
 
 # MARK: Functions
 
@@ -440,6 +449,10 @@ printlog(){
     log_priority=$2
     timestamp=$(date +%F\ %T)
 
+    # Never log the GitHub API token
+    [[ -n $githubAPIToken ]] && log_message=${log_message//${(b)githubAPIToken}/<redacted>}
+    [[ -n $GITHUB_API_TOKEN ]] && log_message=${log_message//${(b)GITHUB_API_TOKEN}/<redacted>}
+
     # Check to make sure that the log isn't the same as the last, if it is then don't log and increment a timer.
     if [[ ${log_message} == ${previous_log_message} ]]; then
         let logrepeat=$logrepeat+1
@@ -506,6 +519,59 @@ deduplicatelogs() {
 
         logoutput+="$log\n"
     done <<< "$loginput"
+}
+
+# Resolve the GitHub API token once, first match wins:
+# 1. GITHUB_API_TOKEN (argument or set in script)
+# 2. github_api_token_option (App-Auto-Patch has sourced these functions)
+# 3. App-Auto-Patch managed preferences (GitHubAPIAuthEnabled + GitHubAPIToken)
+# returns 1 if no token is available
+resolveGitHubAPIToken() {
+    if [[ -z $githubAPITokenResolved ]]; then
+        githubAPITokenResolved=1
+        githubAPIToken=""
+        local tokenSource="none"
+        local aapManagedPLIST="/Library/Managed Preferences/xyz.techitout.appAutoPatch"
+        if [[ -n $GITHUB_API_TOKEN ]]; then
+            githubAPIToken=$GITHUB_API_TOKEN
+            tokenSource="argument"
+        elif [[ -n $github_api_token_option ]]; then
+            githubAPIToken=$github_api_token_option
+            tokenSource="App-Auto-Patch"
+        elif [[ -f "${aapManagedPLIST}.plist" ]]; then
+            local aapAuthEnabled=$(defaults read "$aapManagedPLIST" GitHubAPIAuthEnabled 2>/dev/null)
+            if [[ ${aapAuthEnabled:l} == (true|1|yes) ]]; then
+                githubAPIToken=$(defaults read "$aapManagedPLIST" GitHubAPIToken 2>/dev/null)
+                # trim leading/trailing whitespace
+                githubAPIToken="${githubAPIToken#"${githubAPIToken%%[![:space:]]*}"}"
+                githubAPIToken="${githubAPIToken%"${githubAPIToken##*[![:space:]]}"}"
+                [[ -n $githubAPIToken ]] && tokenSource="App-Auto-Patch managed preferences"
+            fi
+        fi
+        # log to stderr, curl output is often captured with $(...)
+        printlog "GitHub API token source: $tokenSource" INFO >&2
+    fi
+    [[ -n $githubAPIToken ]]
+}
+
+# Wrapper adding the GitHub API token to requests to api.github.com,
+# so labels calling curl directly are covered as well.
+# Falls back to an unauthenticated request if the authenticated one fails.
+curl() {
+    local arg useToken=0 hasAuthHeader=0
+    for arg in "$@"; do
+        [[ $arg == https://api.github.com/* ]] && useToken=1
+        [[ ${arg:l} == authorization:* ]] && hasAuthHeader=1
+    done
+    if (( useToken && ! hasAuthHeader )) && resolveGitHubAPIToken; then
+        command curl -H "Authorization: Bearer $githubAPIToken" "$@"
+        local curlStatus=$?
+        if [[ $curlStatus -ne 22 ]]; then
+            return $curlStatus
+        fi
+        printlog "GitHub API request with token failed, retrying without token" WARN >&2
+    fi
+    command curl "$@"
 }
 
 # will get the latest release download from a github repo
@@ -1466,9 +1532,10 @@ argumentsArray=()
 while [[ -n $1 ]]; do
     if [[ $1 =~ ".*\=.*" ]]; then
         # if an argument contains an = character, send it to eval
+        # eval before logging, so printlog can redact secrets (GITHUB_API_TOKEN)
+        eval $1
         printlog "setting variable from argument $1" INFO
         argumentsArray+=( $1 )
-        eval $1
     fi
     # shift to next argument
     shift 1
@@ -2662,14 +2729,14 @@ awscli2)
 awsvpnclient)
     name="AWS VPN Client"
     type="pkg"
-    baseURL="https://d20adtppz83p9s.cloudfront.net/OSX"
-    appNewVersion=$(curl -s "https://docs.aws.amazon.com/vpn/latest/clientvpn-user/client-vpn-user-guide.rss" | grep -o 'AWS provided client ([0-9]*\.[0-9]*\.[0-9]*) for macOS' | head -1 | grep -o '[0-9]*\.[0-9]*\.[0-9]*')
-    if [[ $(arch) == "arm64" ]]
-    then
-        downloadURL="${baseURL}_ARM64/${appNewVersion}/AWS_VPN_Client_ARM64.pkg"
+    if [[ $(arch) == "arm64" ]]; then
+        appcastURL="https://d3c4iklh14o4hj.cloudfront.net/OSX_ARM64/latest/appcast.xml"
     else
-        downloadURL="${baseURL}/${appNewVersion}/AWS_VPN_Client.pkg"
+        appcastURL="https://d3c4iklh14o4hj.cloudfront.net/OSX/latest/appcast.xml"
     fi
+    appcastXML="$(curl -fsL "$appcastURL")"
+    downloadURL="$(echo "$appcastXML" | xpath 'string(//rss/channel/item[1]/enclosure/@url)' 2>/dev/null)"
+    appNewVersion="$(echo "$appcastXML" | xpath 'string(//rss/channel/item[1]/enclosure/@sparkle:version)' 2>/dev/null)"
     expectedTeamID="94KV3E626L"
     ;;
 axurerp10)
@@ -5366,6 +5433,16 @@ firecutforpremierepro)
     expectedTeamID="7ASRSVAEMS"
     blockingProcesses=( "Adobe Premiere Pro 2024" "Adobe Premiere Pro 2025" "Adobe Premiere Pro 2026" "Adobe Premiere Pro 2027" )
     ;;
+firefox)
+    name="Firefox"
+    type="dmg"
+    downloadURL="https://download.mozilla.org/?product=firefox-latest&os=osx&lang=en-US"
+    firefoxVersions=$(curl -fs "https://product-details.mozilla.org/1.0/firefox_versions.json")
+    appNewVersion=$(getJSONValue "$firefoxVersions" "LATEST_FIREFOX_VERSION")
+    expectedTeamID="43AQ936H96"
+    blockingProcesses=( firefox )
+    printlog "WARNING for ERROR: Label firefox and firefox_intl should not be used. Instead use firefoxpkg and firefoxpkg_intl as per recommendations from Firefox. It's not fully certain that the app actually gets updated here. firefoxpkg and firefoxpkg_intl will have built in updates and make sure the client is updated in the future." REQ
+    ;;
 firefox_da)
     name="Firefox"
     type="dmg"
@@ -5397,16 +5474,6 @@ firefox_intl)
         printlog "Download not found for '$userLanguage', using default ('en-US')."
         downloadURL="https://download.mozilla.org/?product=firefox-latest-ssl&os=osx"
     fi
-    firefoxVersions=$(curl -fs "https://product-details.mozilla.org/1.0/firefox_versions.json")
-    appNewVersion=$(getJSONValue "$firefoxVersions" "LATEST_FIREFOX_VERSION")
-    expectedTeamID="43AQ936H96"
-    blockingProcesses=( firefox )
-    printlog "WARNING for ERROR: Label firefox and firefox_intl should not be used. Instead use firefoxpkg and firefoxpkg_intl as per recommendations from Firefox. It's not fully certain that the app actually gets updated here. firefoxpkg and firefoxpkg_intl will have built in updates and make sure the client is updated in the future." REQ
-    ;;
-firefox)
-    name="Firefox"
-    type="dmg"
-    downloadURL="https://download.mozilla.org/?product=firefox-latest&os=osx&lang=en-US"
     firefoxVersions=$(curl -fs "https://product-details.mozilla.org/1.0/firefox_versions.json")
     appNewVersion=$(getJSONValue "$firefoxVersions" "LATEST_FIREFOX_VERSION")
     expectedTeamID="43AQ936H96"
@@ -5457,6 +5524,15 @@ firefoxesrpkgintl)
     appNewVersion=${appNewVersion:0:-3}
     expectedTeamID="43AQ936H96"
     ;;
+firefoxpkg)
+    name="Firefox"
+    type="pkg"
+    downloadURL="https://download.mozilla.org/?product=firefox-pkg-latest-ssl&os=osx&lang=en-US"
+    firefoxVersions=$(curl -fs "https://product-details.mozilla.org/1.0/firefox_versions.json")
+    appNewVersion=$(getJSONValue "$firefoxVersions" "LATEST_FIREFOX_VERSION")
+    expectedTeamID="43AQ936H96"
+    blockingProcesses=( firefox )
+    ;;
 firefoxpkg_intl)
     # This label will try to figure out the selected language of the user,
     # and install corrosponding version of Firefox ESR
@@ -5480,15 +5556,6 @@ firefoxpkg_intl)
         printlog "Download not found for that language. Using en-US" WARN
         downloadURL="https://download.mozilla.org/?product=firefox-pkg-latest-ssl&os=osx&lang=en-US"
     fi
-    firefoxVersions=$(curl -fs "https://product-details.mozilla.org/1.0/firefox_versions.json")
-    appNewVersion=$(getJSONValue "$firefoxVersions" "LATEST_FIREFOX_VERSION")
-    expectedTeamID="43AQ936H96"
-    blockingProcesses=( firefox )
-    ;;
-firefoxpkg)
-    name="Firefox"
-    type="pkg"
-    downloadURL="https://download.mozilla.org/?product=firefox-pkg-latest-ssl&os=osx&lang=en-US"
     firefoxVersions=$(curl -fs "https://product-details.mozilla.org/1.0/firefox_versions.json")
     appNewVersion=$(getJSONValue "$firefoxVersions" "LATEST_FIREFOX_VERSION")
     expectedTeamID="43AQ936H96"
@@ -12019,6 +12086,14 @@ thoriumreader)
     appNewVersion=$(versionFromGit edrlab thorium-reader)
     expectedTeamID="327YA3JNGT"
     ;;
+thunderbird)
+    name="Thunderbird"
+    type="dmg"
+    versionKey="CFBundleShortVersionString"
+    appNewVersion=$(curl -s "https://www.thunderbird.net/en-US/thunderbird/releases/atom.xml" | xmllint --xpath "//*[local-name()='entry']/*[local-name()='title'][not(contains(text(), 'esr'))]/text()" - | head -1 | awk '{ print $2 }')
+    downloadURL="https://download.mozilla.org/?product=thunderbird-${appNewVersion}-SSL&os=osx&lang=en-US"
+    expectedTeamID="43AQ936H96"
+    ;;
 thunderbird_intl)
     # This label will try to figure out the selected language of the user,
     # and install corrosponding version of Thunderbird
@@ -12043,14 +12118,6 @@ thunderbird_intl)
     appNewVersion=$(curl -fsIL $downloadURL | awk -F releases/ '/Location:/ {split($2,a,"/"); print a[1]}')
     expectedTeamID="43AQ936H96"
     blockingProcesses=( thunderbird )
-    ;;
-thunderbird)
-    name="Thunderbird"
-    type="dmg"
-    versionKey="CFBundleShortVersionString"
-    appNewVersion=$(curl -s "https://www.thunderbird.net/en-US/thunderbird/releases/atom.xml" | xmllint --xpath "//*[local-name()='entry']/*[local-name()='title'][not(contains(text(), 'esr'))]/text()" - | head -1 | awk '{ print $2 }')
-    downloadURL="https://download.mozilla.org/?product=thunderbird-${appNewVersion}-SSL&os=osx&lang=en-US"
-    expectedTeamID="43AQ936H96"
     ;;
 thunderbirdesr)
     name="Thunderbird"
