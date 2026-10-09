@@ -83,6 +83,15 @@ printlog(){
     log_priority=$2
     timestamp=$(date +%F\ %T)
 
+    # Never log the GitHub API token
+    [[ -n $githubAPIToken ]] && log_message=${log_message//${(b)githubAPIToken}/<redacted>}
+    [[ -n $GITHUB_API_TOKEN ]] && log_message=${log_message//${(b)GITHUB_API_TOKEN}/<redacted>}
+    # also any GITHUB_API_TOKEN=... argument, even if the variable was overwritten later
+    () {
+        setopt localoptions extendedglob
+        log_message=${log_message//GITHUB_API_TOKEN=[^[:space:]]#/GITHUB_API_TOKEN=<redacted>}
+    }
+
     # Check to make sure that the log isn't the same as the last, if it is then don't log and increment a timer.
     if [[ ${log_message} == ${previous_log_message} ]]; then
         let logrepeat=$logrepeat+1
@@ -149,6 +158,66 @@ deduplicatelogs() {
 
         logoutput+="$log\n"
     done <<< "$loginput"
+}
+
+# Resolve the GitHub API token once, first match wins:
+# 1. GITHUB_API_TOKEN (argument or set in script)
+# 2. github_api_token_option (App-Auto-Patch has sourced these functions)
+# 3. App-Auto-Patch managed preferences (GitHubAPIAuthEnabled + GitHubAPIToken)
+# returns 1 if no token is available
+resolveGitHubAPIToken() {
+    if [[ -z $githubAPITokenResolved ]]; then
+        githubAPITokenResolved=1
+        githubAPIToken=""
+        local tokenSource="none"
+        local aapManagedPLIST="/Library/Managed Preferences/xyz.techitout.appAutoPatch"
+        if [[ -n $GITHUB_API_TOKEN ]]; then
+            githubAPIToken=$GITHUB_API_TOKEN
+            tokenSource="argument"
+        elif [[ -n $github_api_token_option ]]; then
+            githubAPIToken=$github_api_token_option
+            tokenSource="App-Auto-Patch"
+        elif [[ -f "${aapManagedPLIST}.plist" ]]; then
+            local aapAuthEnabled=$(defaults read "$aapManagedPLIST" GitHubAPIAuthEnabled 2>/dev/null)
+            if [[ ${aapAuthEnabled:l} == (true|1|yes) ]]; then
+                githubAPIToken=$(defaults read "$aapManagedPLIST" GitHubAPIToken 2>/dev/null)
+                # trim leading/trailing whitespace
+                githubAPIToken="${githubAPIToken#"${githubAPIToken%%[![:space:]]*}"}"
+                githubAPIToken="${githubAPIToken%"${githubAPIToken##*[![:space:]]}"}"
+                [[ -n $githubAPIToken ]] && tokenSource="App-Auto-Patch managed preferences"
+            fi
+        fi
+        # log to stderr, curl output is often captured with $(...)
+        printlog "GitHub API token source: $tokenSource" INFO >&2
+    fi
+    [[ -n $githubAPIToken ]]
+}
+
+# Wrapper adding the GitHub API token to requests to api.github.com,
+# so labels calling curl directly are covered as well.
+# Falls back to an unauthenticated request if the authenticated one fails.
+curl() {
+    local arg useToken=0 hasAuthHeader=0
+    local otherURL=0
+    for arg in "$@"; do
+        if [[ $arg == https://api.github.com/* ]]; then
+            useToken=1
+        elif [[ $arg =~ '^[a-zA-Z][a-zA-Z0-9+.-]*://' ]]; then
+            # any other URL in the same call would receive the header as well
+            otherURL=1
+        fi
+        [[ ${arg:l} == authorization:* ]] && hasAuthHeader=1
+    done
+    (( otherURL )) && useToken=0
+    if (( useToken && ! hasAuthHeader )) && resolveGitHubAPIToken; then
+        command curl -H "Authorization: Bearer $githubAPIToken" "$@"
+        local curlStatus=$?
+        if [[ $curlStatus -ne 22 ]]; then
+            return $curlStatus
+        fi
+        printlog "GitHub API request with token failed, retrying without token" WARN >&2
+    fi
+    command curl "$@"
 }
 
 # will get the latest release download from a github repo

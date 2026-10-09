@@ -39,9 +39,10 @@ argumentsArray=()
 while [[ -n $1 ]]; do
     if [[ $1 =~ ".*\=.*" ]]; then
         # if an argument contains an = character, send it to eval
+        # eval before logging, so printlog can redact secrets (GITHUB_API_TOKEN)
+        eval $1
         printlog "setting variable from argument $1" INFO
         argumentsArray+=( $1 )
-        eval $1
     fi
     # shift to next argument
     shift 1
